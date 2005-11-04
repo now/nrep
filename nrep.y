@@ -1,16 +1,20 @@
-# TODO: two parses, first macro-expansion (as below) and then rule-expansion, i.e.,
-# x/…/, y/…/, g/…/, v/…/ (where x is default, or something).
+#  TODO: try to simplify this a bit.  Perhaps we don’t have to be so fuzzy about
+# all the arrays
+# TODO: refactor Grepper and Output.  Some timesavings if more is known in
+# Grepper.  (Maybe)
+# Inverted guards: <!(ret)>/<not(ret)>
 class RRep::Parser
 rule
-  regex         : { result = ['', []] }
+  regex         : { result = GuardedRegexp.new } # { result = ['', []] }
                 | regex atom { 
-                  if val[1].is_a? Array 
-                    val[0][0] << val[1][0]
-                    val[0][1] << val[1][1]
-                  else
-                    val[0][0] << val[1]
-                  end
-                  result = val[0]
+                  result = val[0] << val[1]
+#                  if val[1].is_a? Array 
+#                    val[0][0] << val[1][0]
+#                    val[0][1] << val[1][1]
+#                  else
+#                    val[0][0] << val[1]
+#                  end
+#                  result = val[0]
                 }
 
   atom          : LITERAL
@@ -18,11 +22,18 @@ rule
 
   rule          : '<' IDENT parameters '>' {
                   rs = Rules[val[1]].call(*val[2])
-                  if rs.is_a? Array
-                    result = [/#{rs[0]}/.source, rs[1]]
+                  case rs
+                  when GuardedRegexp
+                    result = rs
                   else
                     result = /#{rs}/.source
                   end
+#                  if rs.is_a? Array
+#                    result = GuardedRegexp.new(/#{rs[0]}/.source, rs[1]])
+#                    result = [/#{rs[0]}/.source, rs[1]]
+#                  else
+#                    result = /#{rs}/.source
+#                  end
                 }
     #result = /#{Rules[val[1]].call(*val[2])}/.source }
 
@@ -40,15 +51,78 @@ require 'ostruct'
 
 $KCODE = 'u'
 
+# TODO: perhaps GuardedRegexp and all this shoudn’t be here.  Perhaps the parse
+# should be separate from the actual conversion, as we seem to be doing a lot
+# of translations between Regexps and Strings and Guards and GuardedRegexps.
+class Guard
+  def initialize(gregex, inverted = false)
+    @gregex, @inverted = gregex, inverted
+#    @regex, @own_guards, @inverted = /#{regex[0]}/, regex[1], inverted
+  end
+
+  def match(s)
+    if m = @gregex.regex.match(s)
+      @inverted ? nil : m[0]
+    else
+      @inverted ? s : nil
+    end
+  end
+
+  def own_guards
+    @gregex.guards
+  end
+
+  def build
+    @gregex.build
+  end
+
+#  attr_reader :own_guards
+end
+
+# TODO: this class can perhaps be used for all rules, with empty guards
+# shouldn'9t @guards << other.guards be @guard.concat(other.guards)
+class GuardedRegexp
+  def initialize(regex = //, guards = [])
+    @regex, @guards = /#{regex}/.source, guards
+  end
+
+  def <<(other)
+    case other
+    when GuardedRegexp
+      # TODO: use other.regex here now, right?
+      @regex << /#{other.regex}/.source
+      @guards.concat(other.guards)
+    when String
+      @regex << other
+    else
+      p 'uhoh'
+    end
+    self
+  end
+
+  # TODO: a way to tell the regexp to build itself and stay this way:
+  def build
+    @regex = /#{regex}/
+    @guards.each{ |guard| guard.build }
+  end
+
+  attr_accessor :regex, :guards
+end
+
+
 ---- inner ----
 
   Rules = {
-    'tag' => proc{ |tag, r| [/<#{tag}(?:\s+\w+(?:="[^"\\]*(\\.[^"\\]*)*")?)*>.*?<\/#{tag}>/m, [/#{r[0]}/, r[1]]] },
-    'instring' => proc{ |r| [/"[^"\\]*(\\.[^"\\]*)*"/, [/#{r[0]}/, r[1]]] },
-#    'instring' => proc { |r| /"(\\.|[^\\"])*#{r}(\\.|[^\\"])*"/ },
+    'tag' => proc{ |tag, r| GuardedRegexp.new(/<#{tag.regex}(?:\s+\w+(?:="[^"\\]*(\\.[^"\\]*)*")?)*>.*?<\/#{tag.regex}>/m, [Guard.new(r)]) },
+    'instring' => proc{ |r| GuardedRegexp.new(/"[^"\\]*(\\.[^"\\]*)*"/, [Guard.new(r)]) },
+#    'tag' => proc{ |tag, r| [/<#{tag}(?:\s+\w+(?:="[^"\\]*(\\.[^"\\]*)*")?)*>.*?<\/#{tag}>/m, Guard.new(r)] },
+#    'instring' => proc{ |r| [/"[^"\\]*(\\.[^"\\]*)*"/, Guard.new(r)] },
+#    'tag' => proc{ |tag, r| [/<#{tag}(?:\s+\w+(?:="[^"\\]*(\\.[^"\\]*)*")?)*>.*?<\/#{tag}>/m, [/#{r[0]}/, r[1]]] },
+#    'instring' => proc{ |r| [/"[^"\\]*(\\.[^"\\]*)*"/, [/#{r[0]}/, r[1]]] },
     'ws' => proc { /\s+/ }
   }
 
+  # TODO: need to add escaping and better error-handling
   def tokenizer(str, toplevel = true)
     q = []
 
@@ -191,7 +265,7 @@ Usage: #{ApplicationName} [OPTION]... PATTERN [FILE]...
    or: #{ApplicationName} --pattern=PATTERN [FILE]...
    or: #{ApplicationName} --file=FILE [FILE]...
 Search for PATTERN in each FILE or standard input.
-Example: nrep 'looking for gold' /dev/nose
+Example: nrep 'looking for gold' /dev/high /dev/low /dev/nose
 EOB
 
   opts.separator ''
@@ -290,7 +364,8 @@ EOH
     $options.with_filename = false
   end
 
-  opts.on('--label=LABEL', 'print LABEL as filename for standard input') do |label|
+  opts.on('--label=LABEL',
+          'print LABEL as filename for standard input') do |label|
     $options.label = label
   end
 
@@ -299,7 +374,8 @@ EOH
     $options.filename_header = ' ' * (indent or 2)
   end
 
-  opts.on('-o', '--only-matching', 'show only the part of a line matching PATTERN') do
+  opts.on('-o', '--only-matching',
+          'show only the part of a line matching PATTERN') do
     $options.only_matching = true
   end
 
@@ -335,15 +411,18 @@ EOH
     $options.devices = action.intern
   end
 
-  opts.on('--include=PATTERN', 'files that match PATTERN will be examined') do |pattern|
+  opts.on('--include=PATTERN',
+          'files that match PATTERN will be examined') do |pattern|
     $options.include << pattern
   end
 
-  opts.on('--exclude=PATTERN', 'files that match PATTERN will be skipped') do |pattern|
+  opts.on('--exclude=PATTERN',
+          'files that match PATTERN will be skipped') do |pattern|
     $options.exclude << pattern
   end
 
-  opts.on('--exclude-from=FILE', 'files that match PATTERN in FILE will be skipped') do |path|
+  opts.on('--exclude-from=FILE',
+          'files that match PATTERN in FILE will be skipped') do |path|
     begin
       IO.foreach(path){ |pattern| $options.exclude << pattern }
     rescue Errno::ENOENT, Errno::EACCES => e
@@ -351,11 +430,13 @@ EOH
     end
   end
 
-  opts.on('-L', '--files-without-match', 'only print FILE names containing no match') do
+  opts.on('-L', '--files-without-match',
+          'only print FILE names containing no match') do
     $options.filename_selection = :without
   end
 
-  opts.on('-l', '--files-with-matches', 'only print FILE names containing matches') do
+  opts.on('-l', '--files-with-matches',
+          'only print FILE names containing matches') do
     $options.filename_selection = :with
   end
 
@@ -371,13 +452,15 @@ EOH
   opts.separator 'Context Control:'
 
   COLOR_WHEN = ['auto', 'always', 'never']
-  opts.on('--color[=WHEN]', '--colour[=WHEN]', '--farbe[=WHEN]', '--couleur[=WHEN]',
-          '--farve[=WHEN]', '--färg[=WHEN]', '--väri[=WHEN]', '--kleur[=WHEN]',
-          '--colore[=WHEN]', '--koloro[=WHEN]', '--farge[=WHEN]', '--barwa[=WHEN]',
-          '--cor[=WHEN]', '--barva[=WHEN]', '--klöör[=WHEN]', '--palli[=WHEN]',
-          '--barva[=WHEN]', '--warna[=WHEN]', '--цвят[=WHEN]', '--szín[=WHEN]',
-          '--culuri[=WHEN]', '--renk[=WHEN]', '--coleur[=WHEN]', '--spalva[=WHEN]',
-          '--màu-sắc[=WHEN]', '--цвет[=WHEN]',
+  opts.on('--color[=WHEN]',     '--colour[=WHEN]',  '--farbe[=WHEN]',
+          '--couleur[=WHEN]',   '--farve[=WHEN]',   '--färg[=WHEN]',
+          '--väri[=WHEN]',      '--kleur[=WHEN]',   '--colore[=WHEN]',
+          '--koloro[=WHEN]',    '--farge[=WHEN]',   '--barwa[=WHEN]',
+          '--cor[=WHEN]',       '--barva[=WHEN]',   '--klöör[=WHEN]',
+          '--palli[=WHEN]',     '--barva[=WHEN]',   '--warna[=WHEN]',
+          '--цвят[=WHEN]',      '--szín[=WHEN]',    '--culuri[=WHEN]',
+          '--renk[=WHEN]',      '--coleur[=WHEN]',  '--spalva[=WHEN]',
+          '--màu-sắc[=WHEN]',   '--цвет[=WHEN]',
           COLOR_WHEN,
           'use markers to distinguish the matching string',
           'WHEN may be ‘auto’, ‘always’, or ‘never’') do |w|
@@ -519,11 +602,11 @@ private
 end
 
 class Grepper
-  def initialize(output, regex, guards)
+  def initialize(output, regex)
     @eol = $options.null_data ? "\0" : "\n"
     @output = output
-    @regex = regex
-    @guards = guards
+    @regex = regex.regex
+    @guards = regex.guards
   end
 
   def grep(file)
@@ -592,7 +675,7 @@ private
   end
   
   def passes_guards(guards, match)
-    not guards.find{ |guard, own_guards| guard !~ match or not passes_guards(own_guards, $~[0]) }
+    not guards.find{ |guard| (not (m = guard.match(match))) or (not passes_guards(guard.own_guards, m)) }
   end
 
   def advance(m, i)
@@ -601,10 +684,10 @@ private
 end
 
 class Runner
-  def initialize(regex, guards)
+  def initialize(regex)
     @output = Output.new
     @found_line = @had_errors = false
-    @grepper = Grepper.new(@output, regex, guards)
+    @grepper = Grepper.new(@output, regex)
     @directories = Hash.new{ [] }
   end
 
@@ -682,8 +765,9 @@ begin
     usage(opts) if ARGV.size == 0
     $options.regexp = ARGV.shift
   end
-  regex, guards = RRep::Parser.new.parse($options.regexp)
-  regex = Regexp.new("#{$options.regexp_before}#{regex}#{$options.regexp_after}", $options.regexp_options)
+  regex = RRep::Parser.new.parse($options.regexp)
+  regex = GuardedRegexp.new(Regexp.new("#{$options.regexp_before}#{regex.regex}#{$options.regexp_after}", $options.regexp_options), regex.guards)
+  regex.build
 rescue => e
   $messenger.fatal(e.message)
 end
@@ -692,4 +776,4 @@ $options.with_filename = true if ARGV.size > 1
 
 ARGV.push('-') if ARGV.size == 0
 
-Runner.new(regex, guards).execute(ARGV)
+Runner.new(regex).execute(ARGV)
