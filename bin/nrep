@@ -1,31 +1,20 @@
-class RRep::Parser
-rule
-  regex         : { result = GuardedRegexp.new }
-                | regex atom { 
-                  result = val[0] << val[1]
-                }
+#! /usr/bin/ruby -w
+# contents: nrep - now’s regular-expression print.
+#
+# Copyright © 2006 Nikolai Weibull <now@bitwi.se>
 
-  atom          : LITERAL
-                | rule
-
-  rule          : '{' IDENT parameters '}' {
-                  result = Rules[val[1]].call(*val[2])
-                }
-
-  parameters    : { result = [] }
-                | '(' parameterlist ')' { result = val[1] }
-
-  parameterlist : regex { result = [val[0]] }
-                | parameterlist ',' regex { result = val[0] << val[2] }
-end
-
----- header ----
-
+require 'stringio'
 require 'optparse'
 require 'ostruct'
-require 'ned/patternmatcher'
+require 'matcher/pattern/pore'
 
 $KCODE = 'u'
+
+Rules = {
+  'tag' => proc{ |tag, r| GuardedRegexp.new(%{\\<#{tag.regex}[<ws>+<ident>+<ws>*[=<ws>*"<[^"\\\\]>*[\\\\.<[^"\\\\]>*]*"]?]*\\>.*?\\</#{tag.regex}\\>}, [Guard.new(r)]) },
+'instring' => proc{ |r| GuardedRegexp.new(%{"<[^"\\\\]>*[\\\\.<[^"\\\\]>*]*"}, [Guard.new(r)]) },
+  'ws' => proc { '\\s+' }
+}
 
 class Guard
   def initialize(guarded_regex, inverted = false)
@@ -61,6 +50,8 @@ class GuardedRegexp
       @guards.concat(other.guards)
     when String
       @regex << other
+    when Fixnum
+      @regex << other.chr
     else
       raise "can’t concatenate #{other.class.name} to a #{self.class.name}"
     end
@@ -68,94 +59,104 @@ class GuardedRegexp
   end
 
   def build
-    @regex = PatternMatcher.new(@regex)
+    @regex = Matcher::Pattern::Pore.new(@regex)
     @guards.each{ |guard| guard.build }
   end
 
   attr_accessor :regex, :guards
 end
 
+class GuardedRegexpParser
+  def parse(string)
+    @io = StringIO.new(string)
+    parse_regexp
+  end
 
----- inner ----
+private
 
-  Rules = {
-    'tag' => proc{ |tag, r| GuardedRegexp.new(%{\\<#{tag.regex}[<ws>+<ident>+<ws>*[=<ws>*"<[^"\\\\]>*[\\\\.<[^"\\\\]>*]*"]?]*\\>.*?\\</#{tag.regex}\\>}, [Guard.new(r)]) },
-  'instring' => proc{ |r| GuardedRegexp.new(%{"<[^"\\\\]>*[\\\\.<[^"\\\\]>*]*"}, [Guard.new(r)]) },
-    'ws' => proc { '\\s+' }
-  }
+  def getc
+    raise ArgumentError, "unexpected end of string" if @io.eof?
+    @io.getc
+  end
 
-  # TODO: need to add escaping and better error-handling
-  def tokenizer(str, toplevel = true)
-    q = []
+  def eat(wanted)
+    c = getc
+    @io.ungetc c unless c == wanted
+    c == wanted
+  end
 
-    until str.empty? or (not toplevel and str =~ /\A[,)]/) do
-      case str
-      when /\A\\(.)/
-        q.push [:LITERAL, $1]
-        str = $'
-      when /\A{/
-        q.push [$&, $&]
-        str = $'
-        done = false
-        until done or str.empty? do
-          case str
-          when /\A}/
-            q.push [$&, $&]
-            done = true
-          when /\A\w+/
-            q.push [:IDENT, $&]
-            str = $'
-            if str =~ /\A\(/
-              q.push [$&, $&]
-              str = $'
-              innerdone = false
-              until innerdone or str.empty? do
-                case str
-                when /\A\)/
-                  q.push [$&, $&]
-                  innerdone = true
-                when /\A,/ # TODO: (?:\s*)/
-                  q.push [',', ',']
-                else
-                  a, str = tokenizer(str, false)
-                  q.concat(a)
-                  next
-                end
-                str = $'
-              end
-            else
-              next
-            end
-          else
-            raise "can’t lex beginning at #{str}"
-          end
-          str = $'
+  def peek
+    c = @io.getc
+    @io.ungetc c
+    c
+  end
+
+  def parse_regexp(terminators = [])
+    result = GuardedRegexp.new
+    until @io.eof?
+      result <<
+        case c = getc
+        when ?\\
+          "\\" + getc.chr
+        when ?<
+          parse_rule
+        when *terminators
+          @io.ungetc c
+          break
+        else
+          c
         end
-      else
-        c = str[0, 1]
-        q.push [:LITERAL, c]
-        str = str[1..-1]
-        next
-      end
-      str = $'
     end
-    
-    [q, str]
+    result
   end
 
-  def parse(str)
-    @q, _ = tokenizer(str)
-
-    @q.push [false, '$end']
-
-    do_parse
+  def parse_rule
+    name = parse_rule_name
+    return '<' + name unless Rules.include? name
+    Rules[name].call(*parse_rule_arguments)
   end
 
-  def next_token
-    @q.shift
+  def parse_rule_name
+    result = ""
+    loop do
+      case c = getc
+      when ?\\
+        result << "\\" + getc
+      when ?(
+        break
+      when ?>
+        @io.ungetc c
+        break
+      else
+        result << c
+      end
+    end
+    result
   end
 
----- footer ----
+  def parse_rule_arguments
+    result = []
+    loop do
+      case c = peek
+      when ?)
+        break
+      when ?>
+        getc
+        return result
+      else
+        result << parse_rule_argument
+        break if not eat(?,)
+      end
+    end
+    raise ArgumentError, "expected ) at position #{@io.pos}" unless getc == ?)
+    raise ArgumentError, "expected > at position #{@io.pos}" unless getc == ?>
+    result
+  end
+
+  def parse_rule_argument
+    parse_regexp([?,, ?)])
+  end
+end
 
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
@@ -345,7 +346,6 @@ class Grepper
         report(m)
         adjust_input(m)
         throw :done if $options.max >= 0 and matches >= $options.max
-        @end_of_previous_match_in_read_input = m[0].end
       end
     end
     @output.matches
@@ -354,7 +354,15 @@ class Grepper
   def read
     if not @gave_remaining_input and @read_input.length > 0
       @gave_remaining_input = true
+      @input_offset = 0
       return @read_input
+    end
+
+    if @input_offset != -1
+      @previous_input << @read_input
+      @input_offset += @read_input.length
+    else
+      @input_offset = 0
     end
 
     @line += @read_input.countc(@eol, 0, @read_input.length)
@@ -375,26 +383,55 @@ private
     @first_batch = true
     @input = input
     @read_input = ""
-    @gave_remaining_input = false
+    @previous_input = ""
+    @gave_remaining_input = true
     @line = 1
+    @input_offset = -1
   end
 
   def advance_to(match)
-    @line += @read_input.countc(@eol, 0, match[0].begin)
+    @line += @read_input.countc(@eol, 0, match[0].begin - @input_offset)
   end
 
   def report(match)
-    str = @read_input[match[0].begin, match[0].end - match[0].begin]
-    @output.line(@line, '', str, "\n") if passes_guards(@guards, str)
+    b = match[0].begin - @input_offset
+    e = match[0].end - @input_offset
+    len = match[0].end - b
+    str = b < 0 ?
+      @previous_input[b..-1] << @read_input[0, len] :
+      @read_input[b, len]
+    if true
+      # TODO: All this business with @previous_input can be dropped if we turn
+      # every regex into '^.*?(re).*?$', when we aren’t given a record
+      # separator.
+      index = @read_input.rindex(@eol, b)
+      if index
+        prefix = @read_input[(index + 1)..(b - 1)]
+      else
+        index = @previous_input.rindex(@eol)
+        if index
+          prefix = @previous_input[(index + 1)..-1] << @previous_input[0..b]
+        else
+          prefix = ""
+        end
+      end
+      index = @read_input.index(@eol, e)
+      if index
+        suffix = @read_input[e..index]
+      else
+        suffix = @read_input
+      end
+    end
+    @output.line(@line, prefix, str, suffix) if passes_guards(@guards, str)
   end
 
   def adjust_input(match)
-    @read_input = @read_input[match[0].end..-1]
+    @previous_input = ""
+    @read_input = @read_input[(match[0].end - @input_offset)..-1]
     @gave_remaining_input = false
   end
 
   def passes_guards(guards, match)
-    p match
     not guards.find{ |guard| (not (m = guard.match(match))) or (not passes_guards(guard.own_guards, m)) }
   end
 
@@ -756,7 +793,7 @@ begin
     usage(opts) if ARGV.size == 0
     $options.regexp = ARGV.shift
   end
-  regex = RRep::Parser.new.parse($options.regexp)
+  regex = GuardedRegexpParser.new.parse($options.regexp)
 #  regex = GuardedRegexp.new(Regexp.new("#{$options.regexp_before}#{regex.regex}#{$options.regexp_after}", $options.regexp_options), regex.guards)
   regex.build
 rescue => e
